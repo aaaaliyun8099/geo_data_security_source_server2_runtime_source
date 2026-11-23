@@ -166,10 +166,15 @@ def _apply_bits(band: np.ndarray, starts: np.ndarray, bits: list[int], spb: int)
         return 0
     offsets = np.arange(spb, dtype=np.int64)
     rows = band.shape[0]
+    # 掩码必须按 band 自身的 dtype 生成：uint8 栅格上 `& ~1` 里的 -2 超出 uint8 范围，
+    # NumPy 2.x 直接抛 "Python integer -2 out of bounds for uint8"（实测 15:12 L14 DEM 失败）。
+    # 用 dtype 类型构造掩码，无符号与有符号栅格都成立。
+    keep_mask = np.bitwise_not(band.dtype.type(1))
+    bit_one = band.dtype.type(1)
     for i, bit in enumerate(bits):
         cols = (starts[:, None] + (i * spb + offsets)[None, :]).ravel()
         picked = band[:, cols]
-        band[:, cols] = (picked & ~1) | bit
+        band[:, cols] = (picked & keep_mask) | (bit_one * bit)
     return int(rows * starts.size)
 
 

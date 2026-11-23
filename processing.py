@@ -41,6 +41,26 @@ def partial_verification_passed(verification: dict) -> bool:
 _VECTOR_SUFFIX_TYPE = {".gpkg": "GPKG", ".shp": "SHP", ".geojson": "GEOJSON", ".json": "GEOJSON"}
 
 
+def _payload_carrier_summary(source: Path, limit: int = 6) -> str:
+    """列出载荷里实际有哪些文件，用于把「没有 .shp」讲成运维能直接动手的话。"""
+    base = Path(source)
+    try:
+        files = [base] if base.is_file() else sorted(p for p in base.rglob("*") if p.is_file())
+    except OSError:
+        return "无法读取"
+    counts: dict[str, int] = {}
+    samples: dict[str, str] = {}
+    for item in files:
+        suffix = item.suffix.lower() or "<无扩展名>"
+        counts[suffix] = counts.get(suffix, 0) + 1
+        samples.setdefault(suffix, item.name)
+    if not counts:
+        return "目录为空（0 个文件）"
+    ordered = sorted(counts.items(), key=lambda kv: -kv[1])
+    parts = [f"{suffix}×{count}（{samples[suffix][:40]}）" for suffix, count in ordered[:limit]]
+    return "、".join(parts) + ("…" if len(ordered) > limit else "")
+
+
 def _content_vector_type(source: Path) -> str | None:
     """Return the vector format actually present in the payload, ignoring the declared type.
 
@@ -495,9 +515,19 @@ class ProcessingService:
         from .vector_watermark import embed_shapefile_watermark
 
         source_dir = Path(source_dir)
-        layers = sorted(path for path in source_dir.rglob("*.shp") if path.is_file()) if source_dir.is_dir() else []
+        # 大写 .SHP 在 Linux（区分大小写）上 rglob("*.shp") 匹配不到，统一按扩展名小写判断；
+        # 单文件载荷（S1 只传了一个 .shp）以前直接落到「没有图层」，把现场问题说成了空话。
+        if source_dir.is_file():
+            raise ValueError(
+                f"no .shp layers found：本次上传的是单个文件 {source_dir.name}，"
+                "而 Shapefile 水印要写进 .dbf 属性表，必须 .shp/.shx/.dbf/.prj 同名整套一起上传。"
+                "请把整个图层目录打成 ZIP 重新上传（或用工具导出为单个 .gpkg 后按 GPKG 上传）。")
+        layers = sorted(path for path in source_dir.rglob("*") if path.is_file() and path.suffix.lower() == ".shp")
         if not layers:
-            raise ValueError("no .shp layers found")
+            raise ValueError(
+                f"no .shp layers found：解包目录里没有 .shp，实际内容：{_payload_carrier_summary(source_dir)}。"
+                "若是 File Geodatabase(.gdb)、CAD(.dwg/.dxf)、压缩包里还套着压缩包或空目录，"
+                "请先导出为 Shapefile（.shp/.shx/.dbf/.prj）或转成单个 .gpkg 再上传。")
         text = watermark_text or f"{user_id}|{timestamp}"
         artifact_id, output_dir = self._artifact_dir(project_id)
         try:

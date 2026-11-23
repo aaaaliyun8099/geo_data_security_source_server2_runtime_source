@@ -48,6 +48,8 @@ from .loan_store import (LoanStore, STATUS_LENT, STATUS_OVERDUE, STATUS_RETURNED
                          VERDICT_OK, VERDICT_OVERDUE, VERDICT_MISMATCH,
                          VERDICT_NOT_OURS, VERDICT_UNKNOWN, summarize as summarize_loans,
                          default_due)
+from .circulation import CirculationStore
+from .circulation_api import build_circulation_router
 from .chain_board import render_html as render_chain_board
 from .chain_graph import render_html as render_chain_graph
 from .sandbox_console import render_html as render_sandbox_console
@@ -83,6 +85,27 @@ def rejected_result_guard(status: str) -> None:
     """A rejected result is a decision, not a missing approval - report it as such."""
     if status == APPROVAL_REJECTED:
         raise HTTPException(status_code=409, detail="result was rejected by manual review and is not deliverable")
+
+
+def _asset_source_resolver(task_store):
+    """把流转资产上的 result_id 解析成真实产出路径（文件或目录）。"""
+    def resolve(asset: dict) -> Path | None:
+        result_id = str((asset or {}).get("result_id") or "")
+        if not result_id:
+            return None
+        record = task_store.get_artifact_record(result_id)
+        output = (record or {}).get("output") or ""
+        candidate = Path(str(output)) if output else None
+        return candidate if candidate and candidate.exists() else None
+    return resolve
+
+
+def _result_status_resolver(task_store):
+    """查成果当前审批状态；库里没有这条成果时返回 None（由调用方要求显式水印号）。"""
+    def status(result_id: str) -> str | None:
+        record = task_store.get_artifact_record(result_id)
+        return (record or {}).get("status")
+    return status
 
 
 def partial_watermark_acceptable(manifest: dict) -> bool:
@@ -1670,6 +1693,8 @@ def create_app(
     audit_log_dir: Path | str | None = None,
     task_database_path: Path | str | None = None,
     loan_database_path: Path | str | None = None,
+    circulation_database_path: Path | str | None = None,
+    circulation_export_root: Path | str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Geo Data Security Server2")
 
@@ -1690,6 +1715,11 @@ def create_app(
     app.state.task_store = task_store
     loan_store = LoanStore(loan_database_path or (Path(workspace) / "state" / "loans.sqlite3"))
     app.state.loan_store = loan_store
+    # 《记录2》大类 1–3 的业务台账：账号/项目/三区资产/申请审批/授权归还/提醒告警/版本。
+    circulation_store = CirculationStore(
+        circulation_database_path or (Path(workspace) / "state" / "circulation.sqlite3"),
+        export_root=circulation_export_root or (Path(workspace) / "exports" / "users"))
+    app.state.circulation_store = circulation_store
     admin_auth = AdminAuthStore(task_store.database_path, Path(workspace) / "state" / "superadmin.bootstrap.txt")
     app.state.admin_auth = admin_auth
     sandbox_policy = SandboxPolicyStore(Path(workspace) / "state" / "sandbox_policy.sqlite3", Path(workspace))
@@ -5032,6 +5062,17 @@ def create_app(
                          resumable=[item["task_id"] for item in stale if item.get("resumable")][:50])
     except Exception as exc:  # 清理失败不能阻止服务启动
         audit_record("TASKS_STALE_CLEANUP_FAILED", actor="system", reason=str(exc))
+
+    app.include_router(build_circulation_router(
+        circulation_store,
+        admin_identity=admin_identity,
+        require_service=lambda value: _require_service_token(value),
+        audit_record=audit_record,
+        export_root=Path(circulation_export_root) if circulation_export_root
+        else Path(workspace) / "exports" / "users",
+        asset_source=_asset_source_resolver(task_store),
+        result_status=_result_status_resolver(task_store),
+    ))
 
     return app
 
