@@ -1,0 +1,68 @@
+r"""server2 服务启动入口: 按部署配置装配 ProcessingService(TrustMark 引擎可选)、
+审计日志目录和只读结果服务, 供 uvicorn 加载。
+
+用法(部署机):
+    set GDS_WORKSPACE=V:\geo_data_security
+    set GEO_SECURITY_SERVER1_TOKEN=...
+    set GDS_TRUSTMARK_PYTHON=...\trustmark_venv\Scripts\python.exe
+    uvicorn geo_security.serve:app --host 0.0.0.0 --port 9081
+
+只读输出端口可另起: uvicorn geo_security.serve:readonly_app --port 9082
+(readonly_app 与主 app 共享同一 workspace 状态; 单进程部署时同 app 提供 /readonly/*)
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+from .api import create_app
+
+DEFAULT_WORKSPACE = Path(os.environ.get("GDS_WORKSPACE", "V:/geo_data_security"))
+KEY_MATERIAL = os.environ.get("GDS_WORKSPACE_KEY", "local-prototype-key-material").encode()
+
+
+def _trustmark_engine_or_none():
+    """Build the TrustMark engine only when the isolated venv is reachable."""
+    try:
+        from .trustmark_engine import TrustMarkGeoTIFFEngine
+
+        return TrustMarkGeoTIFFEngine()
+    except Exception as exc:  # noqa: BLE001 - degrade to baseline watermarking
+        print(f"TrustMark engine unavailable, falling back to baseline watermarking: {exc}", file=sys.stderr)
+        return None
+
+
+def _audit_dir() -> Path | None:
+    configured = os.environ.get("GDS_AUDIT_DIR")
+    if not configured:
+        return None
+    return Path(configured)
+
+
+def _task_database() -> Path:
+    configured = os.environ.get("GDS_TASK_DATABASE")
+    if configured:
+        return Path(configured)
+    return DEFAULT_WORKSPACE / "state" / "server2.sqlite3"
+
+
+from .processing import ProcessingService  # noqa: E402
+
+_engine = _trustmark_engine_or_none()
+_service = ProcessingService(workspace=DEFAULT_WORKSPACE, key=KEY_MATERIAL, trustmark_engine=_engine)
+
+app = create_app(
+    workspace=DEFAULT_WORKSPACE,
+    key=KEY_MATERIAL,
+    allowed_input_roots=[DEFAULT_WORKSPACE, Path(os.environ.get("GDS_INPUT_ROOT", DEFAULT_WORKSPACE))],
+    processing_service=_service,
+    audit_log_dir=_audit_dir(),
+    task_database_path=_task_database(),
+    loan_database_path=Path(os.environ.get("GDS_LOAN_DATABASE", str(DEFAULT_WORKSPACE / "state" / "loans.sqlite3"))),
+)
+
+# 定时清理线程只在生产入口启动：create_app 被测试直接调用时不应该起后台线程。
+# GDS_RETENTION_SCHEDULER=0 可关闭（例如排查问题或由外部调度接管）。
+if os.environ.get("GDS_RETENTION_SCHEDULER", "1") != "0":
+    app.state.storage_policy.start_scheduler()
