@@ -4,6 +4,7 @@ import hashlib
 import json
 import threading
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Iterator
 
 from .crypto import canonical_json
@@ -121,16 +122,24 @@ class LocalTraceChain:
 
     def _anchor_async(self, record: dict[str, Any]) -> None:
         """后台锚定一条已落盘的记录。失败不抛出，避免线程静默死掉时无人知晓。"""
+        started_at = perf_counter()
+        outcome = "failed"
         try:
             from .besu_anchor import anchor_record
             receipt = anchor_record(record)
             self._persist_anchor(record["record_hash"], record["event_type"], receipt)
+            outcome = "confirmed"
         except Exception as exc:  # noqa: BLE001
             try:
                 self._persist_anchor(record["record_hash"], record["event_type"],
                                      {"onchain": False, "status": 0, "error": f"{type(exc).__name__}: {exc}"})
             except Exception:
                 pass
+        finally:
+            result_id = record.get("artifact_id")
+            if result_id and record.get("event_type") == "WATERMARK_VERIFIED":
+                print(f"[TIMING] result={result_id} besu_anchor "
+                      f"{perf_counter() - started_at:.3f}s outcome={outcome}", flush=True)
 
     def _anchor_path(self) -> Path:
         return self.path.with_suffix(".anchors.jsonl")

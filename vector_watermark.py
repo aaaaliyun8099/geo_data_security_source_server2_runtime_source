@@ -5,7 +5,8 @@ from pathlib import Path
 
 import shapefile
 
-from .crypto import TextCipher, decrypt_text
+from .crypto import TextCipher
+from .shp_dbf_fast import try_embed, try_extract
 from .watermark_policy import marker_digest, reembed_allowed
 
 
@@ -29,10 +30,16 @@ def geometry_digest(path: Path) -> str:
 
 def embed_shapefile_watermark(source: Path, destination: Path, text: str, key: bytes,
                               report: dict | None = None) -> tuple[str, str]:
+    watermark_name = "_wm"
+    written_shp = try_embed(source, destination, text, key)
+    if written_shp is not None:
+        if report is not None:
+            report.update(rewatermarked=False, previous_marker_sha256=None)
+        return sha256_file(written_shp), watermark_name
+
     reader = shapefile.Reader(str(source), encoding="gbk", encodingErrors="replace")
     fields = list(reader.fields[1:])
     field_names = {field[0].upper() for field in fields}
-    watermark_name = "_wm"
     existing = watermark_name.upper() in field_names
     if existing and not reembed_allowed():
         raise ValueError(f"source already contains reserved field {watermark_name}（当前为严格取证策略，禁止二次嵌入）")
@@ -116,10 +123,19 @@ def embed_shapefile_watermark(source: Path, destination: Path, text: str, key: b
 
 
 def extract_shapefile_watermark(path: Path, key: bytes) -> list[str]:
-    reader = shapefile.Reader(str(path), encoding="gbk", encodingErrors="replace")
-    names = [field[0] for field in reader.fields[1:]]
-    try:
-        index = next(i for i, name in enumerate(names) if name.lower() == "_wm")
-    except StopIteration as exc:
-        raise ValueError("watermark field not found") from exc
-    return [decrypt_text(record[index], key) for record in reader.iterRecords()]
+    values = try_extract(path, key)
+    if values is not None:
+        return values
+
+    with shapefile.Reader(str(path), encoding="gbk", encodingErrors="replace") as reader:
+        names = [field[0] for field in reader.fields[1:]]
+        try:
+            index = next(i for i, name in enumerate(names) if name.lower() == "_wm")
+        except StopIteration as exc:
+            raise ValueError("watermark field not found") from exc
+        cipher = TextCipher(key)
+        try:
+            projected = reader.iterRecords(fields=[names[index]])
+        except TypeError:  # Compatibility with PyShp releases before field projection.
+            return [cipher.decrypt(record[index]) for record in reader.iterRecords()]
+        return [cipher.decrypt(record[0]) for record in projected]

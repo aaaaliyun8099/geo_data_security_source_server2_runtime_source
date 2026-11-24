@@ -7,8 +7,10 @@ import uuid
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from .crypto import encrypt_text
 from .verification import verify_geotiff
@@ -39,6 +41,17 @@ def partial_verification_passed(verification: dict) -> bool:
 
 
 _VECTOR_SUFFIX_TYPE = {".gpkg": "GPKG", ".shp": "SHP", ".geojson": "GEOJSON", ".json": "GEOJSON"}
+
+
+@contextmanager
+def _shp_phase(result_id: str, phase: str):
+    started_at = perf_counter()
+    outcome = "failed"
+    try:
+        yield
+        outcome = "ok"
+    finally:
+        print(f"[TIMING] result={result_id} shp_{phase} {perf_counter() - started_at:.3f}s outcome={outcome}", flush=True)
 
 
 def _payload_carrier_summary(source: Path, limit: int = 6) -> str:
@@ -531,25 +544,27 @@ class ProcessingService:
         text = watermark_text or f"{user_id}|{timestamp}"
         artifact_id, output_dir = self._artifact_dir(project_id)
         try:
-            if sandbox_compute.enabled():
-                # 单次沙箱会话批量嵌入全部图层（避免逐层拉起进程；1GB 级图层目录必需）
-                jobs_dir = Path(self.workspace) / "sandbox" / "work" / "jobs"
-                jobs_dir.mkdir(parents=True, exist_ok=True)
-                filelist = jobs_dir / f"shp_batch_{uuid.uuid4().hex}.json"
-                filelist.write_text(json.dumps({
-                    "layers": [
-                        {"src": str(source), "dst": str(output_dir / source.name), "text": text}
-                        for source in layers
-                    ],
-                }, ensure_ascii=False), encoding="utf-8")
-                try:
-                    sandbox_compute.run("shp_batch_embed", str(filelist))
-                finally:
-                    filelist.unlink(missing_ok=True)
-            else:
-                for source in layers:
-                    embed_shapefile_watermark(source, output_dir / source.name, text, self.key)
-            self._write_manifest(output_dir, project_id, artifact_id, "SHP", source_dir, output_dir, len(layers), classification, precision_report)
+            with _shp_phase(artifact_id, "embed"):
+                if sandbox_compute.enabled():
+                    # 单次沙箱会话批量嵌入全部图层（避免逐层拉起进程；1GB 级图层目录必需）
+                    jobs_dir = Path(self.workspace) / "sandbox" / "work" / "jobs"
+                    jobs_dir.mkdir(parents=True, exist_ok=True)
+                    filelist = jobs_dir / f"shp_batch_{uuid.uuid4().hex}.json"
+                    filelist.write_text(json.dumps({
+                        "layers": [
+                            {"src": str(source), "dst": str(output_dir / source.name), "text": text}
+                            for source in layers
+                        ],
+                    }, ensure_ascii=False), encoding="utf-8")
+                    try:
+                        sandbox_compute.run("shp_batch_embed", str(filelist))
+                    finally:
+                        filelist.unlink(missing_ok=True)
+                else:
+                    for source in layers:
+                        embed_shapefile_watermark(source, output_dir / source.name, text, self.key)
+            with _shp_phase(artifact_id, "manifest_hash"):
+                self._write_manifest(output_dir, project_id, artifact_id, "SHP", source_dir, output_dir, len(layers), classification, precision_report)
             preexisting = []
             for layer in layers:
                 try:
@@ -560,7 +575,8 @@ class ProcessingService:
                 except Exception:
                     pass
             self._mark_rewatermark(output_dir, preexisting)
-            self._verify_manifest(output_dir, "SHP", output_dir, text)
+            with _shp_phase(artifact_id, "verify"):
+                self._verify_manifest(output_dir, "SHP", output_dir, text)
             self._trace_manifest(output_dir, "WATERMARK_VERIFIED")
             return ProcessingArtifact(artifact_id, "SHP", str(source_dir), str(output_dir), len(layers), "PENDING")
         except Exception:

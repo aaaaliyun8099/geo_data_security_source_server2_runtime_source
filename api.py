@@ -1316,15 +1316,16 @@ def resolve_declared_carrier(declared: str, directory: Path) -> tuple[Path, str]
                         detail=f"解包目录里有 {len(converted)} 个矢量数据文件，无法确定核验对象：{names}")
 
 
-def _prepare_task_source(source: Path) -> Path:
+def _prepare_task_source(source: Path, *, task_id: str | None = None) -> Path:
     """Prepare an uploaded archive in the worker thread, never in the HTTP request."""
     source = Path(source)
     if source.suffix.lower() != ".zip":
         return source
     extracted = source.parent / "payload"
     marker = extracted / ".gds_extract_complete"
+    task_context = f" task={task_id[:12]}" if task_id else ""
     if marker.is_file():
-        print(f"[TIMING] extract cache-hit {source.name}", flush=True)
+        print(f"[TIMING] extract cache-hit {source.name}{task_context}", flush=True)
         return extracted
     lock = source.parent / ".extract.lock"
     try:
@@ -1337,11 +1338,11 @@ def _prepare_task_source(source: Path) -> Path:
     try:
         if extracted.exists():
             shutil.rmtree(extracted)
-        _t_extract = time.time()
+        _t_extract = time.perf_counter()
         with zipfile.ZipFile(source) as archive:
             inventory = _extract_archive(archive, staging)
-        print(f"[TIMING] extract {time.time() - _t_extract:.1f}s "
-              f"members={len(inventory)} zip={source.stat().st_size / 2**30:.2f}GB", flush=True)
+        print(f"[TIMING] extract {time.perf_counter() - _t_extract:.1f}s "
+              f"members={len(inventory)} zip={source.stat().st_size / 2**30:.2f}GB{task_context}", flush=True)
         if extracted.exists():
             shutil.rmtree(extracted)
         staging.replace(extracted)
@@ -1493,9 +1494,9 @@ def _run_task(app, request: TaskRequest, source: Path, task_id: str, audit_recor
             _HEAVY_GATE.acquire()
         acquired = True
     try:
-        _t_prepare = time.time()
-        prepared_source = _prepare_task_source(source)
-        print(f"[TIMING] task={task_id[:12]} prepare {time.time() - _t_prepare:.1f}s", flush=True)
+        _t_prepare = time.perf_counter()
+        prepared_source = _prepare_task_source(source, task_id=task_id)
+        print(f"[TIMING] task={task_id[:12]} prepare {time.perf_counter() - _t_prepare:.1f}s", flush=True)
         if prepared_source.is_dir() and prepared_source.name == "payload":
             label = f"extracted payload of {Path(source).name}"
         else:
@@ -1590,11 +1591,13 @@ def _run_task(app, request: TaskRequest, source: Path, task_id: str, audit_recor
                 _set_osgb_hook(_osgb_hook)
             except Exception:  # noqa: BLE001
                 _set_osgb_hook = None
-        _t_process = time.time()
+        _t_process = time.perf_counter()
+        artifact = None
         try:
             artifact = _process_task(request, prepared_source, app.state.processing_service, scans if 'scans' in locals() else None)
         finally:
-            print(f"[TIMING] task={task_id[:12]} process {time.time() - _t_process:.1f}s", flush=True)
+            result_context = f" result={artifact.artifact_id}" if artifact is not None else ""
+            print(f"[TIMING] task={task_id[:12]} process {time.perf_counter() - _t_process:.1f}s{result_context}", flush=True)
             if _set_osgb_hook is not None:
                 try:
                     _set_osgb_hook(None)
