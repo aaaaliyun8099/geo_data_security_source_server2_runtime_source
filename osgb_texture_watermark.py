@@ -1,10 +1,11 @@
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
-import tempfile
 import threading
+from typing import NamedTuple
 
 from PIL import Image
 
@@ -16,6 +17,31 @@ from .texture_watermark import (
     embed_texture_watermark_adaptive_jpeg,
     extract_texture_watermark_adaptive_jpeg,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class _NoEmbeddedJpeg(ValueError):
+    pass
+
+
+class _JpegSlotTooSmall(ValueError):
+    pass
+
+
+class _JpegRecord(NamedTuple):
+    start: int
+    end: int
+    declared_length: int | None
+
+
+class _UnsupportedJpegLayout(ValueError):
+    def __init__(self, record: _JpegRecord, reason: str):
+        super().__init__(reason)
+        self.offset = record.start
+        self.declared_length = record.declared_length
+        self.jpeg_length = record.end - record.start
 
 
 def _jpeg_spans(data: bytes):
@@ -129,35 +155,57 @@ def watermark_osgb_bytes(data: bytes, transform, watermark: int) -> bytes:
 def rewrite_osgb_bytes(data: bytes, transform, watermark: int) -> bytes:
     """Rewrite embedded JPEGs and their immediately preceding uint32 lengths.
 
-    This is intentionally limited to the length-bearing image records observed
-    in the supplied OSGB files. Unknown offset tables are not guessed; callers
-    must provide a format-specific serializer before using this on other OSGB
-    variants.
+    The legacy layout permits rewriting lengths. A tile with zero-padded
+    records instead keeps every JPEG slot and container offset unchanged.
     """
     rewritten, _ = _rewrite_osgb_bytes_counted(data, transform, watermark)
     return rewritten
 
 
+def _jpeg_records(data: bytes) -> list[_JpegRecord]:
+    records = []
+    cursor = 0
+    for start, end in _jpeg_spans(data):
+        length_pos = start - 4
+        if length_pos < cursor:
+            record = _JpegRecord(start, end, None)
+            raise _UnsupportedJpegLayout(record, "JPEG has no independent length field")
+        declared = int.from_bytes(data[length_pos:start], "little")
+        record = _JpegRecord(start, end, declared)
+        record_end = start + declared
+        if record_end < end or record_end > len(data):
+            raise _UnsupportedJpegLayout(record, "JPEG length falls outside its record bounds")
+        if record_end != end and data[end:record_end].strip(b"\x00"):
+            raise _UnsupportedJpegLayout(record, "JPEG record has an unrecognized nonzero trailer")
+        records.append(record)
+        cursor = record_end
+    if not records:
+        raise _NoEmbeddedJpeg("OSGB contains no complete embedded JPEG")
+    return records
+
+
 def _rewrite_osgb_bytes_counted(data: bytes, transform, watermark: int) -> tuple[bytes, int]:
-    spans = list(_jpeg_spans(data))
-    if not spans:
-        raise ValueError("OSGB contains no complete embedded JPEG")
+    records = _jpeg_records(data)
+    fixed_slots = any(record.declared_length != record.end - record.start for record in records)
     chunks: list[bytes] = []
     cursor = 0
-    for start, end in spans:
-        if start < 4:
-            raise ValueError("embedded JPEG has no length field")
-        length_pos = start - 4
-        original_length = int.from_bytes(data[length_pos:start], "little")
-        if original_length != end - start:
-            raise ValueError("OSGB JPEG length field does not match payload")
+    for record in records:
+        start, end, _ = record
         replacement = bytes(transform(data[start:end], watermark))
-        chunks.append(data[cursor:length_pos])
-        chunks.append(len(replacement).to_bytes(4, "little"))
+        if fixed_slots:
+            try:
+                replacement = _pad_jpeg(replacement, end - start)
+            except _JpegSlotTooSmall as exc:
+                raise _UnsupportedJpegLayout(record, str(exc)) from exc
+            # The original length field and any zero trailer remain in place.
+            chunks.append(data[cursor:start])
+        else:
+            chunks.append(data[cursor:start - 4])
+            chunks.append(len(replacement).to_bytes(4, "little"))
         chunks.append(replacement)
         cursor = end
     chunks.append(data[cursor:])
-    return b"".join(chunks), len(spans)
+    return b"".join(chunks), len(records)
 
 
 def _watermark_jpeg_fixed(payload: bytes, watermark: int) -> bytes:
@@ -201,32 +249,64 @@ def embed_osgb_jpeg_watermark(payload: bytes, watermark: int) -> bytes:
 
 def extract_osgb_jpeg_watermark(payload: bytes, watermark: int) -> dict:
     marker = _small_jpeg_marker(watermark)
-    position = payload.find(marker)
-    return {"detected": position >= 0, "payload_bits": 32, "method": "jpeg_com", "expected": f"{watermark:08X}"}
+    detected = any(
+        code == 0xFE and payload[start:end] == marker
+        for code, _, start, end in _jpeg_header_segments(payload)
+    )
+    return {
+        "detected": detected, "payload_bits": 32, "method": "jpeg_com",
+        "expected": f"{watermark:08X}",
+    }
+
+
+def _jpeg_header_segments(data: bytes):
+    """Yield marker, marker offset and payload bounds up to the first scan."""
+    if not data.startswith(b"\xff\xd8"):
+        return
+    position = 2
+    while position + 1 < len(data) and data[position] == 0xFF:
+        marker_start = position
+        while position < len(data) and data[position] == 0xFF:
+            position += 1
+        if position + 2 >= len(data):
+            return
+        marker = data[position]
+        if marker in {0x00, 0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            return
+        length = int.from_bytes(data[position + 1:position + 3], "big")
+        end = position + 1 + length
+        if length < 2 or end > len(data):
+            return
+        yield marker, marker_start, position + 3, end
+        if marker == 0xDA:
+            return
+        position = end
 
 
 def _pad_jpeg(encoded: bytes, target_length: int) -> bytes:
-    """Pad a JPEG with legal APP15 segments before EOI, not after EOI."""
-    if len(encoded) > target_length:
-        raise ValueError("watermarked JPEG is larger than its OSGB slot")
+    """Fit a complete JPEG using legal APP15 segments before its first scan."""
+    segments = list(_jpeg_header_segments(encoded))
+    if not segments or segments[-1][0] != 0xDA or _jpeg_end(encoded, 0) != len(encoded):
+        raise ValueError("watermarked output is not a complete JPEG")
     missing = target_length - len(encoded)
+    if missing < 0:
+        raise _JpegSlotTooSmall("watermarked JPEG is larger than its fixed OSGB slot")
     if missing == 0:
         return encoded
     if missing < 4:
-        raise ValueError("JPEG slot leaves an unrepresentable padding remainder")
-    eoi = encoded.rfind(b"\xff\xd9")
-    if eoi < 0:
-        raise ValueError("watermarked output is not a complete JPEG")
+        raise _JpegSlotTooSmall("fixed JPEG slot leaves an unrepresentable padding remainder")
+    scan_offset = segments[-1][1]
     chunks: list[bytes] = []
     remaining = missing
     while remaining:
         segment_size = min(remaining, 65537)
-        if segment_size < 4:
-            segment_size += 65536
+        tail = remaining - segment_size
+        if 0 < tail < 4:
+            segment_size -= 4 - tail
         payload_size = segment_size - 4
-        chunks.append(b"\xff\xef" + (payload_size + 2).to_bytes(2, "big") + b"GDS" + b"\x00" * (payload_size - 3))
+        chunks.append(b"\xff\xef" + (payload_size + 2).to_bytes(2, "big") + b"\x00" * payload_size)
         remaining -= segment_size
-    return encoded[:eoi] + b"".join(chunks) + encoded[eoi:]
+    return encoded[:scan_offset] + b"".join(chunks) + encoded[scan_offset:]
 
 
 def embed_osgb_bytes(data: bytes, watermark: int) -> tuple[bytes, int]:
@@ -240,41 +320,25 @@ def embed_osgb_bytes(data: bytes, watermark: int) -> tuple[bytes, int]:
 def _embed_osgb_file_with_stats(source: Path, destination: Path, watermark: int) -> dict:
     """Watermark embedded JPEGs, using COM fallback for undersized textures."""
     source, destination = Path(source), Path(destination)
-    data = source.read_bytes()
-    spans = list(_jpeg_spans(data))
-    if not spans:
-        raise ValueError("OSGB contains no complete embedded JPEG")
-    chunks: list[bytes] = []
-    cursor = 0
     pixel_embedded = 0
     small_fallback = 0
-    for start, end in spans:
-        if start < 4:
-            raise ValueError("embedded JPEG has no length field")
-        length_pos = start - 4
-        original_length = int.from_bytes(data[length_pos:start], "little")
-        if original_length != end - start:
-            raise ValueError("OSGB JPEG length field does not match payload")
-        original = data[start:end]
-        try:
-            with Image.open(BytesIO(original)) as image:
-                width, height = image.size
-        except Exception:
-            width = height = 0
-        if min(width, height) < 224:
-            replacement = embed_osgb_jpeg_watermark(original, watermark)
-            small_fallback += 1
-        else:
-            replacement = _watermark_jpeg_fixed_unbounded(original, watermark)
-            pixel_embedded += 1
-        chunks.append(data[cursor:length_pos])
-        chunks.append(len(replacement).to_bytes(4, "little"))
-        chunks.append(replacement)
-        cursor = end
-    chunks.append(data[cursor:])
+
+    def transform(original: bytes, watermark: int) -> bytes:
+        nonlocal pixel_embedded, small_fallback
+        with Image.open(BytesIO(original)) as image:
+            if min(image.size) < 224:
+                image.load()
+                replacement = embed_osgb_jpeg_watermark(original, watermark)
+                small_fallback += 1
+                return replacement
+        replacement = _watermark_jpeg_fixed_unbounded(original, watermark)
+        pixel_embedded += 1
+        return replacement
+
+    rewritten, count = _rewrite_osgb_bytes_counted(source.read_bytes(), transform, watermark)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(b"".join(chunks))
-    return {"embedded_jpegs": len(spans), "pixel_embedded": pixel_embedded, "small_fallback": small_fallback}
+    destination.write_bytes(rewritten)
+    return {"embedded_jpegs": count, "pixel_embedded": pixel_embedded, "small_fallback": small_fallback}
 
 
 def embed_osgb_file(source: Path, destination: Path, watermark: int) -> int:
@@ -303,14 +367,20 @@ def _pool_init(watermark: int) -> None:
 
 
 def _pool_embed_pair(pair: tuple[str, str]) -> tuple[int, int, dict | None]:
-    """进程池里处理单个文件。逻辑与线程版 handle 完全一致，只是参数换成字符串以便跨进程传递。"""
-    source, destination = Path(pair[0]), Path(pair[1])
+    return _embed_pair(Path(pair[0]), Path(pair[1]), _WORKER_WATERMARK)
+
+
+def _embed_pair(source: Path, destination: Path, watermark: int) -> tuple[int, int, dict | None]:
     try:
-        stats = _embed_osgb_file_with_stats(source, destination, _WORKER_WATERMARK)
+        stats = _embed_osgb_file_with_stats(source, destination, watermark)
         return int(stats["pixel_embedded"]), int(stats["small_fallback"]), None
-    except ValueError as exc:
-        if "no complete embedded JPEG" not in str(exc):
-            raise
+    except _UnsupportedJpegLayout as exc:
+        destination.write_bytes(source.read_bytes())
+        return 0, 0, {
+            "source": str(source), "reason": str(exc), "offset": exc.offset,
+            "declared_length": exc.declared_length, "jpeg_length": exc.jpeg_length,
+        }
+    except _NoEmbeddedJpeg as exc:
         destination.write_bytes(source.read_bytes())
         return 0, 0, {"source": str(source), "reason": str(exc)}
 
@@ -375,7 +445,9 @@ def embed_osgb_tree(source_dir: Path, destination_dir: Path, watermark: int,
     total_small_fallback = 0
     processed_files = 0
     skipped_files = []
+    unsupported_layout_tiles = []
     watermarked_files = 0
+    marked_files = 0
     # Directory and sidecar copies stay on this thread; each worker owns a distinct destination
     # file, so no locking is needed and a failure still surfaces as the same ValueError.
     work: list[tuple[Path, Path]] = []
@@ -392,15 +464,7 @@ def embed_osgb_tree(source_dir: Path, destination_dir: Path, watermark: int,
             destination.write_bytes(source.read_bytes())
 
     def handle(pair: tuple[Path, Path]) -> tuple[int, int, dict | None]:
-        source, destination = pair
-        try:
-            stats = _embed_osgb_file_with_stats(source, destination, watermark)
-            return int(stats["pixel_embedded"]), int(stats["small_fallback"]), None
-        except ValueError as exc:
-            if "no complete embedded JPEG" not in str(exc):
-                raise
-            destination.write_bytes(source.read_bytes())
-            return 0, 0, {"source": str(source.relative_to(source_dir)), "reason": str(exc)}
+        return _embed_pair(*pair, watermark)
 
     workers = min(_osgb_workers(), max(1, len(work)))
     hook = progress or _current_hook()
@@ -426,6 +490,21 @@ def embed_osgb_tree(source_dir: Path, destination_dir: Path, watermark: int,
         except Exception:  # noqa: BLE001
             pass
 
+    def collect(results) -> None:
+        nonlocal total, total_small_fallback, processed_files, watermarked_files, marked_files
+        for count, small, skip in results:
+            total += count
+            total_small_fallback += small
+            processed_files += 1
+            watermarked_files += bool(count)
+            marked_files += bool(count or small)
+            if skip:
+                relative = Path(skip.pop("source")).relative_to(source_dir).as_posix()
+                skipped_files.append({"source": relative, "reason": skip["reason"]})
+                if "offset" in skip:
+                    unsupported_layout_tiles.append({"path": relative, **skip})
+            _tick()
+
     if _executor_mode() == "process" and len(work) >= 200:
         # 多进程路线：父进程只做分发与统计，解码/编码全在子进程里跑，
         # 绕开 GIL。结果按完成顺序回收，进度照样每 200 个回报一次。
@@ -434,44 +513,29 @@ def embed_osgb_tree(source_dir: Path, destination_dir: Path, watermark: int,
         pairs = [(str(src), str(dst)) for src, dst in work]
         ctx = _mp.get_context("spawn")
         with ctx.Pool(processes=procs, initializer=_pool_init, initargs=(watermark,)) as pool:
-            for count, small, skip in pool.imap_unordered(_pool_embed_pair, pairs, chunksize=16):
-                total += count
-                total_small_fallback += small
-                processed_files += 1
-                watermarked_files += bool(count)
-                if skip:
-                    skipped_files.append(skip)
-                _tick()
+            collect(pool.imap_unordered(_pool_embed_pair, pairs, chunksize=16))
     elif workers <= 1:
-        results = map(handle, work)
-        for count, small, skip in results:
-            total += count
-            total_small_fallback += small
-            processed_files += 1
-            watermarked_files += bool(count)
-            if skip:
-                skipped_files.append(skip)
-            _tick()
+        collect(map(handle, work))
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for count, small, skip in pool.map(handle, work):
-                total += count
-                total_small_fallback += small
-                processed_files += 1
-                watermarked_files += bool(count)
-                if skip:
-                    skipped_files.append(skip)
-                _tick()
+            collect(pool.map(handle, work))
     (destination_dir / "processing_report.json").write_text(
         json.dumps({
             "files_processed": processed_files,
             "watermarked_files": watermarked_files,
+            "marked_files": marked_files,
             "watermark_skipped_files": len(skipped_files),
             "small_texture_fallbacks": total_small_fallback,
             "skipped": skipped_files,
+            "unsupported_layout_tiles": unsupported_layout_tiles,
             "watermark_method": "jpeg_pixel_carrier_or_preserved_unwatermarked",
         }, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if unsupported_layout_tiles:
+        _LOGGER.warning(
+            "Preserved %d OSGB tiles with unsupported JPEG layouts. First entries: %s",
+            len(unsupported_layout_tiles), json.dumps(unsupported_layout_tiles[:3], ensure_ascii=False),
+        )
     return total
 
 __all__ = [

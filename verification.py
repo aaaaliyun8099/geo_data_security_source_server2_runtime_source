@@ -192,7 +192,7 @@ def verify_textures(output: Path, expected: int, engine) -> dict[str, Any]:
 
 def _verify_osgb_file(args) -> dict:
     """复校单个 .osgb（模块级函数，供多进程池调用）。"""
-    path_str, output_str, expected = args
+    path_str, output_str, expected, verifying_subset = args
     from .osgb_texture_watermark import _jpeg_spans, extract_osgb_jpeg_watermark
     from .texture_watermark import extract_texture_watermark_adaptive_bytes
 
@@ -200,31 +200,37 @@ def _verify_osgb_file(args) -> dict:
     data = path.read_bytes()
     spans = list(_jpeg_spans(data))
     pixel_verified = 0
+    metadata_matched = 0
     not_watermarkable = 0
     for start, end in spans:
         payload = data[start:end]
         if extract_osgb_jpeg_watermark(payload, expected).get("detected"):
             # COM 只算可溯源元数据，按口径不计入像素域成绩。
+            metadata_matched += 1
             not_watermarkable += 1
             continue
         try:
             if extract_texture_watermark_adaptive_bytes(payload, expected).get("detected"):
                 pixel_verified += 1
-        except ValueError:
-            # 纹理小于可靠水印所需尺寸（adaptive_payload_bits 明确拒绝）：
-            # 这类块本来就装不下水印，按"不可承载"跳过，不能让它把整次复校打断
-            # （实测小纹理样本会直接 ValueError，整条任务变成 VERIFICATION_FAILED）。
-            not_watermarkable += 1
         except Exception:  # noqa: BLE001
+            # Keep the legacy full-result sampling behavior. For a partial OSGB result,
+            # an unexpected extraction failure in a supposedly supported tile must fail.
+            if verifying_subset:
+                raise
             not_watermarkable += 1
     rel = str(path.relative_to(Path(output_str))) if output_str else path.name
-    return {"file": rel, "embedded_jpegs": len(spans),
-            "pixel_verified": pixel_verified, "not_watermarkable": not_watermarkable}
+    row = {"file": rel, "embedded_jpegs": len(spans),
+           "pixel_verified": pixel_verified, "not_watermarkable": not_watermarkable}
+    if verifying_subset:
+        row["metadata_matched"] = metadata_matched
+    return row
 
 
-def verify_osgb(output: Path, expected: int) -> dict[str, Any]:
+def verify_osgb(output: Path, expected: int, *, excluded_paths: frozenset[str] = frozenset()) -> dict[str, Any]:
     """Verify OSGB carriers, separating pixel watermarking from small-texture fallback."""
     if sandbox_compute.enabled():
+        if excluded_paths:
+            raise ValueError("sandbox OSGB verification does not support verifying a subset of tiles")
         result = sandbox_compute.run("osgb_verify", str(output), f"{expected:08X}", timeout_s=1800)
         samples = int(result.get("pixel_samples", 0))
         matched = int(result.get("pixel_matched", 0))
@@ -237,7 +243,13 @@ def verify_osgb(output: Path, expected: int) -> dict[str, Any]:
                     files_processed=int(result.get("files_processed", 0)), files=result.get("files", []),
                     runner_user="gds_sbx")
     import os
-    files = sorted(Path(output).rglob("*.osgb"))
+    output = Path(output)
+    files = sorted(output.rglob("*.osgb"))
+    if excluded_paths:
+        paths = {file.relative_to(output).as_posix(): file for file in files}
+        if not excluded_paths <= paths.keys():
+            raise ValueError("OSGB processing report names a skipped tile that is missing from the result")
+        files = [file for name, file in paths.items() if name not in excluded_paths]
     # 抽样上限：全量逐块复校是 O(文件数 × 纹理块)，单块 1024² 纹理解码实测 520 ms，
     # 2.8 万个文件串行要 4 小时，直接把「10 GB 倾斜模型 ≤30 分钟」的指标打爆。
     # 复校目的是确认水印确实写进像素域，等间隔抽样覆盖整棵目录足够。
@@ -256,7 +268,7 @@ def verify_osgb(output: Path, expected: int) -> dict[str, Any]:
     except ValueError:
         workers = 8
 
-    jobs = [(str(p), str(output), expected) for p in files]
+    jobs = [(str(p), str(output), expected, bool(excluded_paths)) for p in files]
     rows: list[dict] = []
     if jobs:
         # 必须用进程池：逐块解码走 scipy.fft.dct，不释放 GIL，线程池实测只有 0.8 核。
@@ -272,13 +284,21 @@ def verify_osgb(output: Path, expected: int) -> dict[str, Any]:
     samples = sum(row["embedded_jpegs"] - row["not_watermarkable"] for row in rows)
     matched = sum(row["pixel_verified"] for row in rows)
     fallback = sum(row["not_watermarkable"] for row in rows)
-    return _row(bool(rows) and ((samples > 0 and matched == samples) or (samples == 0 and fallback > 0)),
-                method="osgb_pixel_carrier_extract_with_small_texture_fallback",
-                samples=samples, matched=matched, not_watermarkable=fallback,
-                verification_quality="PIXEL_ONLY" if fallback == 0 else "PIXEL_PLUS_SMALL_TEXTURE_FALLBACK",
-                sampled_files=len(rows), total_files=total_files,
-                sampling="full" if len(rows) == total_files else f"every {total_files/len(rows):.1f} files",
-                files=rows[:20], files_processed=len(rows))
+    verification = _row(
+        bool(rows) and ((samples > 0 and matched == samples) or (samples == 0 and fallback > 0)),
+        method="osgb_pixel_carrier_extract_with_small_texture_fallback",
+        samples=samples, matched=matched, not_watermarkable=fallback,
+        verification_quality="PIXEL_ONLY" if fallback == 0 else "PIXEL_PLUS_SMALL_TEXTURE_FALLBACK",
+        sampled_files=len(rows), total_files=total_files,
+        sampling="full" if len(rows) == total_files else f"every {total_files/len(rows):.1f} files",
+        files=rows[:20], files_processed=len(rows),
+    )
+    if excluded_paths:
+        metadata_matched = sum(row["metadata_matched"] for row in rows)
+        verification["metadata_matched"] = metadata_matched
+        verification["excluded_files"] = len(excluded_paths)
+        verification["verified"] = verification["verified"] and (matched > 0 or metadata_matched > 0)
+    return verification
 
 
 def verify_dem(output: Path, expected: int) -> dict[str, Any]:

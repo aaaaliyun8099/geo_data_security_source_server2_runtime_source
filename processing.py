@@ -13,13 +13,12 @@ from pathlib import Path
 from time import perf_counter
 
 from .crypto import encrypt_text
-from .verification import verify_geotiff
+from .verification import verify_artifact, verify_geotiff, verify_osgb
 from . import sandbox_compute
 from .geojson_watermark import embed_geojson_watermark
 from .osgb_texture_watermark import embed_osgb_tree
 from .texture_watermark import embed_texture_watermark_adaptive_jpeg
 from .vector_watermark import sha256_file
-from .verification import verify_artifact
 from .classification import Classification, parse_classification
 from .trace_chain import LocalTraceChain
 from .integrity import source_integrity_warning
@@ -214,6 +213,44 @@ class ProcessingService:
         if not result.get("verified"):
             raise ValueError(f"watermark verification failed: {result}")
         return result
+
+    @staticmethod
+    def _osgb_partial_manifest(output_dir: Path, watermark: int) -> dict | None:
+        report_path = output_dir / "processing_report.json"
+        if not report_path.is_file():
+            return None
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        unsupported_tiles = report.get("unsupported_layout_tiles", [])
+        if not unsupported_tiles:
+            return None
+
+        marked_files = int(report["marked_files"])
+        if marked_files <= 0:
+            raise ValueError("OSGB has unsupported texture layouts and no supported tile was watermarked")
+        excluded_paths = frozenset(tile["path"] for tile in unsupported_tiles)
+        verification = verify_osgb(output_dir, watermark, excluded_paths=excluded_paths)
+        if not verification.get("verified") or not (verification["matched"] or verification["metadata_matched"]):
+            raise ValueError("OSGB watermark could not be verified on the supported tiles")
+
+        reason = "OSGB_UNSUPPORTED_TEXTURE_LAYOUT"
+        return {
+            "verification": {**verification, "verified": False, "supported_subset_verified": True},
+            "verification_status": "VERIFIED_PARTIAL",
+            "approval_policy": "MANUAL_REVIEW_REQUIRED",
+            "partial_processing": {
+                "reason": reason,
+                "carrier_unit": "osgb_tile",
+                "carriers_total": int(report["files_processed"]),
+                "carriers_embedded": marked_files,
+                "carriers_skipped": int(report["watermark_skipped_files"]),
+                "unsupported_layout_tiles": len(excluded_paths),
+                "report": report_path.name,
+            },
+            "warnings": [{
+                "code": reason,
+                "message": f"{len(excluded_paths)} 个 OSGB 瓦片的纹理记录无法安全重写，已原样保留，成果需人工复核。",
+            }],
+        }
 
     def process_geojson(self, project_id: str, source: Path, user_id: str, timestamp: str, decimals: int | None = None, classification: Classification | str | None = None, precision_report: dict | None = None) -> ProcessingArtifact:
         from .precision import reduce_geojson_precision
@@ -447,7 +484,9 @@ class ProcessingService:
     def process_osgb_tree(self, project_id: str, source_dir: Path, watermark: int, classification: Classification | str | None = None, processing_profile: str = "PERFORMANCE", precision_report: dict | None = None) -> ProcessingArtifact:
         artifact_id, output_dir = self._artifact_dir(project_id)
         try:
-            if sandbox_compute.enabled() and processing_profile == "STRICT_PER_MEMBER":
+            sandbox_enabled = sandbox_compute.enabled()
+            strict_sandbox = sandbox_enabled and processing_profile == "STRICT_PER_MEMBER"
+            if strict_sandbox:
                 output_dir.mkdir(parents=True, exist_ok=True)
                 for path in source_dir.rglob('*'):
                     if path.is_dir():
@@ -479,7 +518,7 @@ class ProcessingService:
                     for future in as_completed(futures): parts.append(future.result())
                 result={'runner_user':'gds_sbx','files':sum(int(p.get('files',0)) for p in parts),'pixel_samples':sum(int(p.get('pixel_samples',0)) for p in parts),'pixel_matched':sum(int(p.get('pixel_matched',0)) for p in parts),'not_watermarkable':sum(int(p.get('not_watermarkable',0)) for p in parts),'failed':sum(int(p.get('failed',0)) for p in parts)}
                 count = int(result.get('files', 0))
-            elif sandbox_compute.enabled():
+            elif sandbox_enabled:
                 result = sandbox_compute.run('osgb_tree_embed', str(source_dir), str(output_dir), f'{watermark:08X}')
                 count = int(result.get("files_processed", 0) if isinstance(result, dict) else (result or 0))
             else:
@@ -488,7 +527,8 @@ class ProcessingService:
             manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
             manifest["processing_profile"] = processing_profile
             manifest["watermark_method"] = "JPEG_DCT_CPU_PER_MEMBER" if processing_profile == "STRICT_PER_MEMBER" else "SPATIAL_TILE_CARRIER"
-            if processing_profile == "STRICT_PER_MEMBER" and sandbox_compute.enabled():
+            partial = None
+            if strict_sandbox:
                 verification = {
                     "verified": result.get("failed", 0) == 0 and result.get("pixel_samples", 0) > 0 and result.get("pixel_matched", 0) == result.get("pixel_samples", 0),
                     "method": "jpeg_dct_cpu_per_member_extract",
@@ -502,10 +542,14 @@ class ProcessingService:
                 manifest["verification"] = verification
                 manifest["verification_status"] = "VERIFIED" if verification["verified"] else "VERIFICATION_FAILED"
                 manifest["expected_watermark"] = watermark
+            else:
+                partial = self._osgb_partial_manifest(output_dir, watermark)
+                if partial is not None:
+                    manifest.update(partial)
             (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-            if not (processing_profile == "STRICT_PER_MEMBER" and sandbox_compute.enabled()):
+            if not strict_sandbox and partial is None:
                 self._verify_manifest(output_dir, "OSGB", output_dir, watermark)
-            elif not manifest["verification"]["verified"]:
+            elif strict_sandbox and not manifest["verification"]["verified"]:
                 verification = manifest["verification"]
                 if int(verification.get("samples", 0)) == 0:
                     # 不可嵌入不是「处理出错」，是载体类型不支持：说清楚怎么办，别抛字典。
@@ -516,7 +560,7 @@ class ProcessingService:
                         f"（本次文件数 {verification.get('files_processed', 0)}，"
                         f"不可嵌入成员 {verification.get('not_watermarkable', 0)}）")
                 raise ValueError(f"DCT per-member verification failed: {verification}")
-            self._trace_manifest(output_dir, "WATERMARK_VERIFIED")
+            self._trace_manifest(output_dir, "WATERMARK_PARTIAL" if partial is not None else "WATERMARK_VERIFIED")
             return ProcessingArtifact(artifact_id, "OSGB", str(source_dir), str(output_dir), count, "PENDING")
         except Exception:
             self._failed(output_dir)

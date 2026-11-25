@@ -29,6 +29,7 @@ APPROVED_STATES = frozenset({APPROVAL_APPROVED, APPROVAL_PARTIAL})
 # 就按"部分通过"交付，而不是卡在人工复核队列里等一个不会改变结果的签字。
 # 环境变量可覆盖，便于现场按数据质量调整。
 PARTIAL_ACCEPT_MIN_COVERAGE = float(os.environ.get("GDS_PARTIAL_ACCEPT_COVERAGE", "0.95") or 0.95)
+OSGB_LAYOUT_REVIEW_REASON = "OSGB_UNSUPPORTED_TEXTURE_LAYOUT"
 # States a result carries a recorded human decision and therefore never leaves: a reviewer's verdict
 # is not flipped by a later call, and delivering rejected data needs a new task.
 DECIDED_STATES = APPROVED_STATES | {APPROVAL_REJECTED}
@@ -108,6 +109,33 @@ def _result_status_resolver(task_store):
     return status
 
 
+def _requires_osgb_layout_review(manifest: dict) -> bool:
+    return (manifest.get("partial_processing") or {}).get("reason") == OSGB_LAYOUT_REVIEW_REASON
+
+
+def _verified_osgb_subset(manifest: dict) -> bool:
+    verification = manifest.get("verification") or {}
+    return (
+        manifest.get("verification_status") == "VERIFIED_PARTIAL"
+        and verification.get("supported_subset_verified") is True
+        and (_as_int(verification.get("matched"), 0) > 0
+             or _as_int(verification.get("metadata_matched"), 0) > 0)
+    )
+
+
+def _approved_osgb_layout_partial(status: str, manifest: dict) -> bool:
+    review = manifest.get("manual_review") or {}
+    conclusion = review.get("conclusion")
+    return (
+        status == APPROVAL_PARTIAL
+        and _verified_osgb_subset(manifest)
+        and review.get("confirmed") is True
+        and bool(review.get("reviewer_id"))
+        and isinstance(conclusion, str)
+        and bool(conclusion.strip())
+    )
+
+
 def partial_watermark_acceptable(manifest: dict) -> bool:
     """部分处理的成果，水印是否已经达到可交付标准。
 
@@ -118,7 +146,7 @@ def partial_watermark_acceptable(manifest: dict) -> bool:
     这里只看水印证据，不看源文件完整性 —— 完整性由 `SOURCE_TRUNCATED` 警告和
     `verification_status=VERIFIED_PARTIAL` 如实保留，前端照常显示"部分处理"。
     """
-    if manifest.get("verification_status") != "VERIFIED_PARTIAL":
+    if manifest.get("verification_status") != "VERIFIED_PARTIAL" or _requires_osgb_layout_review(manifest):
         return False
     partial = manifest.get("partial_processing") or {}
     total = _as_int(partial.get("carriers_total"))
@@ -1778,7 +1806,8 @@ def create_app(
         as PARTIALLY_APPROVED - which hands the caller an unwatermarked raster. A failed
         verification is a re-run case, not a review case.
         """
-        if data.get("verification_status") == "VERIFICATION_FAILED":
+        if (data.get("verification_status") == "VERIFICATION_FAILED"
+                or (_requires_osgb_layout_review(data) and not _verified_osgb_subset(data))):
             raise HTTPException(
                 status_code=409,
                 detail=("result verification failed; the watermark could not be confirmed, so this result "
@@ -2305,7 +2334,8 @@ def create_app(
                 status_code=409,
                 detail="partial result requires manual_review_confirmed=true and review_conclusion",
             )
-        if is_partial and not request.review_conclusion:
+        if is_partial and (not request.review_conclusion
+                           or (_requires_osgb_layout_review(data) and not request.review_conclusion.strip())):
             raise HTTPException(status_code=422, detail="review_conclusion is required for partial results")
         approval_status = "PARTIALLY_APPROVED" if is_partial else "APPROVED"
         data.update({
@@ -2537,7 +2567,7 @@ def create_app(
         data["artifact_id"] = result_id; data["chain"] = service.trace_chain.verify()
         return data
 
-    def _deliverable(record) -> bool:
+    def _deliverable(record, *, allow_auto_partial: bool = True) -> bool:
         """该成果是否可交付（下载/导出）。
 
         三种放行口径，全部基于已有证据、不改接口契约：
@@ -2546,13 +2576,16 @@ def create_app(
            不影响溯源与交付；
         3. 其余仍按原样拒绝。
         """
-        status = record["artifact"].status
-        if status in APPROVED_STATES:
-            return True
-        if status in DECIDED_STATES:      # REJECTED：人工已否决，不再翻转
+        artifact = record["artifact"]
+        status = artifact.status
+        if status == APPROVAL_REJECTED:
             return False
-        manifest = _load_manifest(Path(getattr(record["artifact"], "output", "") or ""))
-        return bool(manifest) and partial_watermark_acceptable(manifest)
+        if status in APPROVED_STATES and artifact.data_type != "OSGB":
+            return True
+        manifest = _load_manifest(Path(artifact.output))
+        if _requires_osgb_layout_review(manifest):
+            return _approved_osgb_layout_partial(status, manifest)
+        return status in APPROVED_STATES or (allow_auto_partial and partial_watermark_acceptable(manifest))
 
     @app.get("/api/v1/results/{result_id}/export", dependencies=[Depends(require_service_header)])
     def export_result(result_id: str) -> FileResponse:
@@ -2647,6 +2680,12 @@ def create_app(
         job = task_store.get_export_job(export_id)
         if not job or job["status"] != "COMPLETED":
             raise HTTPException(status_code=409, detail="export is not completed")
+        record = task_store.get_artifact_record(job["result_id"])
+        if record and record["artifact"].data_type == "OSGB":
+            artifact = record["artifact"]
+            manifest = _load_manifest(Path(artifact.output))
+            if _requires_osgb_layout_review(manifest) and not _approved_osgb_layout_partial(artifact.status, manifest):
+                raise HTTPException(status_code=404, detail="approved result not found")
         path = Path(job["archive_path"])
         if not path.is_file():
             raise HTTPException(status_code=404, detail="export archive not found")
@@ -4975,11 +5014,11 @@ def create_app(
         is_partial = manifest.get("verification_status") == "VERIFIED_PARTIAL" or manifest.get("source_integrity") == "INCOMPLETE"
         if is_partial and not request.manual_review_confirmed:
             raise HTTPException(status_code=409, detail="partial result requires manual_review_confirmed=true and review_conclusion")
-        if is_partial and not request.review_conclusion:
+        if is_partial and (not request.review_conclusion
+                           or (_requires_osgb_layout_review(manifest) and not request.review_conclusion.strip())):
             raise HTTPException(status_code=422, detail="review_conclusion is required for partial results")
         approval_status = "PARTIALLY_APPROVED" if is_partial else "APPROVED"
         artifact_record["artifact"] = artifact.__class__(artifact.artifact_id, artifact.data_type, artifact.source, artifact.output, artifact.files_processed, approval_status)
-        app.state.task_store.set_artifact_status(result_id, approval_status)
         if manifest_path.is_file():
             manifest.update({"status": approval_status, "approved_by": request.reviewer_id})
             if is_partial:
@@ -4987,6 +5026,7 @@ def create_app(
                 manifest["data_quality_conclusion"] = request.review_conclusion
                 manifest["approval_policy"] = "MANUAL_REVIEW_COMPLETED_PARTIAL_RESULT"
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        app.state.task_store.set_artifact_status(result_id, approval_status)
         audit_record("RESULT_PARTIALLY_APPROVED" if is_partial else "RESULT_APPROVED", actor=request.reviewer_id, result_id=result_id, project_id=artifact_record["project_id"], conclusion=request.review_conclusion if is_partial else None)
         return {"result_id": result_id, "approval_status": approval_status, "data_quality_conclusion": request.review_conclusion if is_partial else None}
 
@@ -4995,7 +5035,7 @@ def create_app(
         artifact_record = app.state.task_store.get_artifact_record(result_id)
         if not artifact_record or artifact_record["user_id"] != user_id or artifact_record["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="result not found")
-        if artifact_record["artifact"].status not in APPROVED_STATES:
+        if not _deliverable(artifact_record, allow_auto_partial=False):
             rejected_result_guard(artifact_record["artifact"].status)
             raise HTTPException(status_code=403, detail="result is not approved")
         audit_record("RESULT_MANIFEST_READ", actor=user_id, result_id=result_id, project_id=project_id)
@@ -5038,7 +5078,7 @@ def create_app(
         if not artifact_record or artifact_record["user_id"] != user_id or artifact_record["project_id"] != project_id:
             raise HTTPException(status_code=404, detail="result not found")
         artifact = artifact_record["artifact"]
-        if artifact.status not in APPROVED_STATES:
+        if not _deliverable(artifact_record, allow_auto_partial=False):
             rejected_result_guard(artifact.status)
             raise HTTPException(status_code=403, detail="result is not approved")
         output_path = Path(artifact.output)
